@@ -42,10 +42,17 @@ typedef enum {
     ST_SUKCES, ST_PORAZKA,
     ST_PAUZA_SUKCES, ST_PAUZA_PORAZKA,
     ST_KONCERT,
+    ST_WOLNA_GRA,
     ST_KONIEC_CZEKAJ
 } stan_gry_t;
 
-typedef enum { TRYB_FREESTYLE = 0, TRYB_MELODIE = 1 } tryb_gry_t;
+typedef enum {
+    TRYB_MEMORY_MIX = 0,   /* losowe sekwencje (dawny Simon)              */
+    TRYB_MELODIE    = 1,   /* nauka melodii krok po kroku + koncert       */
+    TRYB_ODTWARZAJ  = 2,   /* odtwarzacz wybranych melodii z diodami      */
+    TRYB_FREESTYLE  = 3    /* swobodne granie na 7 klawiszach jak pianino */
+} tryb_gry_t;
+
 typedef enum { TR_LATWY, TR_TRUDNY }  trudnosc_t;
 typedef enum { PR_WOLNO, PR_SREDNIO, PR_SZYBKO } predkosc_t;
 
@@ -75,7 +82,8 @@ typedef struct
 /* -------------------- PARAMETRY GRY -------------------------------------- */
 #define DL_MAX_SEKW      50U      /* maksymalna długość sekwencji            */
 #define LICZBA_LED        7U      /* liczba diod i przycisków                */
-#define LICZBA_UTWOROW    4U      /* liczba dostępnych melodii               */
+#define LICZBA_UTWOROW   10U      /* liczba dostępnych melodii               */
+#define LICZBA_TRYBOW     4U      /* Memory Mix, Melodie, Odtwarzaj, Freestyle */
 
 /* -------------------- SPRZĘT – mapowanie pinów --------------------------- */
 static const uint16_t LED_PINY [LICZBA_LED] = {
@@ -111,21 +119,68 @@ static const uint16_t PRZ_PINY [LICZBA_LED] = {
 static volatile lcd_ctx_t lcd;       /* globalny kontekst sterownika */
 static volatile uint8_t   tx_buf[2]; /* 2-bajtowy bufor do I²C-IT   */
 
-/* -------- Buzzer -------- */
-#define NUTA_C4 262
-#define NUTA_D4 294
-#define NUTA_E4 330
-#define NUTA_F4 349
-#define NUTA_G4 392
-#define NUTA_A4 440
-#define NUTA_B4 494
-#define NUTA_C5 523
-#define PAUZA   0
+/* -------- Buzzer – wybór stroju:
+ * 4  = niski     (C4..B4: 262..494 Hz)
+ * 45 = ŚRODKOWY  (G4..F#5: 392..740 Hz – złoty środek, ciepłe brzmienie bez piszczenia!)
+ * 5  = wysoki    (C5..B5: 523..988 Hz)
+ * 6  = b. wysoki (C6..B6: 1047..1976 Hz)
+ * ------------------------------------------------------------------------ */
+#define OKTAWA_BUZZERA 45
 
+/* 4. oktawa (C4..B4) – pierwotna (262..494 Hz) */
+#define NUTA_C4  262
+#define NUTA_D4  294
+#define NUTA_E4  330
+#define NUTA_F4  349
+#define NUTA_G4  392
+#define NUTA_A4  440
+#define NUTA_B4  494
+
+/* ŚRODKOWA GAMA (G4..F#5: 392..740 Hz) – dokładnie w połowie między 4. a 5. oktawą */
+#define NUTA_FS5 740
+
+/* 5. oktawa (C5..B5) – wyższa (523..988 Hz) */
+#define NUTA_C5  523
+#define NUTA_D5  587
+#define NUTA_E5  659
+#define NUTA_F5  698
+#define NUTA_G5  784
+#define NUTA_A5  880
+#define NUTA_B5  988
+
+/* 6. oktawa (C6..B6) – bardzo wysoka (1047..1976 Hz) */
+#define NUTA_C6  1047
+#define NUTA_D6  1175
+#define NUTA_E6  1319
+#define NUTA_F6  1397
+#define NUTA_G6  1568
+#define NUTA_A6  1760
+#define NUTA_B6  1976
+
+#define PAUZA    0
+
+#if (OKTAWA_BUZZERA == 6)
+static const uint16_t LED_NUTY[LICZBA_LED] = {
+    NUTA_C6, NUTA_D6, NUTA_E6, NUTA_F6,
+    NUTA_G6, NUTA_A6, NUTA_B6
+};
+#elif (OKTAWA_BUZZERA == 5)
+static const uint16_t LED_NUTY[LICZBA_LED] = {
+    NUTA_C5, NUTA_D5, NUTA_E5, NUTA_F5,
+    NUTA_G5, NUTA_A5, NUTA_B5
+};
+#elif (OKTAWA_BUZZERA == 45)
+/* Złoty środek: tonacja G-dur (392..740 Hz) – brak buczenia na dole i brak piszczenia u góry */
+static const uint16_t LED_NUTY[LICZBA_LED] = {
+    NUTA_G4, NUTA_A4, NUTA_B4, NUTA_C5,
+    NUTA_D5, NUTA_E5, NUTA_FS5
+};
+#else
 static const uint16_t LED_NUTY[LICZBA_LED] = {
     NUTA_C4, NUTA_D4, NUTA_E4, NUTA_F4,
     NUTA_G4, NUTA_A4, NUTA_B4
 };
+#endif
 
 /* USER CODE END PD */
 
@@ -146,7 +201,7 @@ TIM_HandleTypeDef htim16;
 
 /* -------------------- ZMIENNE GLOBALNE GRY -------------------------------- */
 static volatile stan_gry_t stan_gry = ST_BEZCZYNNY;
-static volatile tryb_gry_t tryb_gry = TRYB_FREESTYLE;
+static volatile tryb_gry_t tryb_gry = TRYB_MEMORY_MIX;
 
 /* bufor sekwencji + kursory ------------------------------------------------ */
 static uint8_t sekwencja[DL_MAX_SEKW];
@@ -168,7 +223,7 @@ static uint8_t idx_menu_pred   = 1;
 static uint8_t idx_menu_dzwiek = 0;
 static uint8_t idx_menu_koniec = 0;
 
-/* baza melodii do trybu "Melodie" (indeksy diod 0..6: C4,D4,E4,F4,G4,A4,B4) */
+/* baza melodii do trybów "Melodie" oraz "Odtwarzaj" (indeksy diod 0..6)     */
 typedef struct {
     const char    *nazwa_menu;
     const uint8_t *nuty;
@@ -191,12 +246,42 @@ static const uint8_t nuty_janie[] = {
 static const uint8_t nuty_stolat[] = {
     4, 2, 4, 2,  4, 5, 4, 3, 2, 3,  3, 1, 3, 1, 3, 4
 };
+/* 5. Super Mario Bros (E E E C E G C | C G E A B A G | E G A F G E C D B) */
+static const uint8_t nuty_mario[] = {
+    2, 2, 2, 0, 2, 4, 0,  0, 4, 2, 5, 6, 5, 4,  2, 4, 5, 3, 4, 2, 0, 1, 6
+};
+/* 6. Jingle Bells (E E E | E E E | E G C D E | F F F F | F E E E | E D D E D G) */
+static const uint8_t nuty_jingle[] = {
+    2, 2, 2,  2, 2, 2,  2, 4, 0, 1, 2,  3, 3, 3, 3,  3, 2, 2, 2,  2, 1, 1, 2, 1, 4
+};
+/* 7. Twinkle Twinkle / Gwiazdeczka (C C G G A A G | F F E E D D C) */
+static const uint8_t nuty_gwiazdka[] = {
+    0, 0, 4, 4, 5, 5, 4,  3, 3, 2, 2, 1, 1, 0
+};
+/* 8. Star Wars – Marsz Imperialny (E E E C G E C G E | B B B C G E C G E) */
+static const uint8_t nuty_starwars[] = {
+    2, 2, 2, 0, 4, 2, 0, 4, 2,  6, 6, 6, 0, 4, 2, 0, 4, 2
+};
+/* 9. Tetris – Korobeiniki (G D E F E D C | C E G F E D | D E F G E C C) */
+static const uint8_t nuty_tetris[] = {
+    4, 1, 2, 3, 2, 1, 0,  0, 2, 4, 3, 2, 1,  1, 2, 3, 4, 2, 0, 0
+};
+/* 10. Bella Ciao (C F G A F | C F G A F | C F G A G F A G F B B B) */
+static const uint8_t nuty_bella[] = {
+    0, 3, 4, 5, 3,  0, 3, 4, 5, 3,  0, 3, 4, 5, 4, 3, 5, 4, 3, 6, 6, 6
+};
 
 static const utwor_t BAZA_UTWOROW[LICZBA_UTWOROW] = {
-    { " 1.Oda radosci >", nuty_oda,    sizeof(nuty_oda)    },
-    { "< 2.Wlazl kotek>", nuty_kotek,  sizeof(nuty_kotek)  },
-    { "< 3.Panie Janie>", nuty_janie,  sizeof(nuty_janie)  },
-    { "<  4.Sto lat    ", nuty_stolat, sizeof(nuty_stolat) }
+    { " 1.Oda radosci >", nuty_oda,      sizeof(nuty_oda)      },
+    { "< 2.Wlazl kotek>", nuty_kotek,    sizeof(nuty_kotek)    },
+    { "< 3.Panie Janie>", nuty_janie,    sizeof(nuty_janie)    },
+    { "<  4.Sto lat   >", nuty_stolat,   sizeof(nuty_stolat)   },
+    { "< 5.Super Mario>", nuty_mario,    sizeof(nuty_mario)    },
+    { "< 6.JingleBells>", nuty_jingle,   sizeof(nuty_jingle)   },
+    { "< 7.Gwiazdeczka>", nuty_gwiazdka, sizeof(nuty_gwiazdka) },
+    { "< 8.Star Wars  >", nuty_starwars, sizeof(nuty_starwars) },
+    { "< 9.Tetris     >", nuty_tetris,   sizeof(nuty_tetris)   },
+    { "<10.Bella Ciao  ", nuty_bella,    sizeof(nuty_bella)    }
 };
 
 /* czasy LED ON/OFF dla trzech prędkości ------------------------------------ */
@@ -210,6 +295,10 @@ static uint32_t deadline_odtw    = 0;
 static volatile uint32_t deadline_led_off[LICZBA_LED] = {0};
 static volatile uint32_t deadline_buzzer  = 0;
 
+/* zmienne pomocnicze dla trybu swobodnego grania (Freestyle) --------------- */
+static uint32_t czas_trzymania_wyjscia = 0;
+static int8_t   aktywna_nuta_freestyle = -1;
+
 /* sterownik odtwarzacza ---------------------------------------------------- */
 static uint8_t  idx_odtw = 0;      /* krok w sekwencji */
 static uint8_t  faza_odtw = 0;     /* 0=OFF 1=ON       */
@@ -217,13 +306,14 @@ static uint8_t  faza_odtw = 0;     /* 0=OFF 1=ON       */
 /* flagi przycisków (ustawiane w IRQ) -------------------------------------- */
 volatile uint8_t flg_up = 0, flg_dn = 0, flg_ok = 0;
 volatile uint8_t flg_stop_koncert = 0;
+static volatile uint8_t prz_zablokowany[LICZBA_LED] = {0};
 
 typedef struct { uint16_t freq; uint16_t ms; } nuta_t; //buzzer
-/* przykład: początek motywu Mario */
+/* przykład: początek motywu Mario (5. oktawa) */
 static const nuta_t melodia_start[] = {
-    {NUTA_E4,150},{NUTA_E4,150},{PAUZA,150},{NUTA_E4,150},
-    {PAUZA,150},{NUTA_C4,150},{NUTA_E4,300},{NUTA_G4,300},
-    {PAUZA,300},{NUTA_G4,300}
+    {NUTA_E5,150},{NUTA_E5,150},{PAUZA,150},{NUTA_E5,150},
+    {PAUZA,150},{NUTA_C5,150},{NUTA_E5,300},{NUTA_G5,300},
+    {PAUZA,300},{NUTA_G5,300}
 };
 static const nuta_t *mel_ptr = 0;
 static uint8_t  mel_len = 0, mel_idx = 0;
@@ -742,7 +832,7 @@ static void Dzwiek_Wlacz(uint8_t nr_led)
     if (nr_led < LICZBA_LED) {
         Buzzer_Ton(LED_NUTY[nr_led]);
     }
-    deadline_buzzer = HAL_GetTick() + 120U;
+    deadline_buzzer = HAL_GetTick() + 180U;
 }
 
 /* bezwarunkowe wyłączenie brzęczyka */
@@ -897,6 +987,9 @@ static void Buzzer_Ton(uint16_t f)
     uint32_t arr = 1000000UL / f - 1;
     __HAL_TIM_SET_AUTORELOAD(&htim16, arr);
     __HAL_TIM_SET_COMPARE(&htim16, TIM_CHANNEL_1, arr / 2);   /* wypełnienie 50% */
+    if (__HAL_TIM_GET_COUNTER(&htim16) >= arr) {
+        __HAL_TIM_SET_COUNTER(&htim16, 0);
+    }
 }
 
 static void Melodia_Start(const nuta_t *m, uint8_t n)
@@ -921,19 +1014,27 @@ static void Menu_Rysuj_Tryb(void)
     LCD_UstawKursor(0,0); LCD_Wypisz("Wybierz gre:");
     LCD_UstawKursor(1,0);
     if (idx_menu_tryb == 0)
-        LCD_Wypisz("   Freestyle   >");
+        LCD_Wypisz("  Memory Mix   >");
+    else if (idx_menu_tryb == 1)
+        LCD_Wypisz("<   Melodie    >");
+    else if (idx_menu_tryb == 2)
+        LCD_Wypisz("<  Odtwarzaj   >");
     else
-        LCD_Wypisz("<   Melodie     ");
+        LCD_Wypisz("<  Freestyle    ");
 }
 
 static void Menu_Rysuj_Akcja(void)
 {
     LCD_Wyczysc();
     LCD_UstawKursor(0,0);
-    if (tryb_gry == TRYB_FREESTYLE)
-        LCD_Wypisz("Tryb: Freestyle");
-    else
+    if (tryb_gry == TRYB_MEMORY_MIX)
+        LCD_Wypisz("Tryb:Memory Mix");
+    else if (tryb_gry == TRYB_MELODIE)
         LCD_Wypisz("Tryb: Melodie");
+    else if (tryb_gry == TRYB_ODTWARZAJ)
+        LCD_Wypisz("Tryb: Odtwarzaj");
+    else
+        LCD_Wypisz("Tryb: Freestyle");
 
     LCD_UstawKursor(1,0);
     if (idx_menu_akcja == 0)
@@ -1025,16 +1126,17 @@ static void Gra_ObsluzStan(void)
             }
             break;
 
-        /* -------- MENU – wybór trybu gry (Freestyle / Melodie) -------- */
+        /* -------- MENU – wybór trybu gry (4 tryby) -------- */
         case ST_MENU_TRYB_CZEKAJ:
-            if (flg_up) { idx_menu_tryb = 0; Menu_Rysuj_Tryb(); flg_up = 0; }
-            if (flg_dn) { idx_menu_tryb = 1; Menu_Rysuj_Tryb(); flg_dn = 0; }
+            if (flg_up && idx_menu_tryb > 0)                   { --idx_menu_tryb; Menu_Rysuj_Tryb(); flg_up = 0; }
+            if (flg_dn && idx_menu_tryb < (LICZBA_TRYBOW - 1)) { ++idx_menu_tryb; Menu_Rysuj_Tryb(); flg_dn = 0; }
             if (flg_ok) {
-                tryb_gry = (idx_menu_tryb == 0) ? TRYB_FREESTYLE : TRYB_MELODIE;
+                flg_up = flg_dn = flg_ok = 0;
+                tryb_gry = (tryb_gry_t)idx_menu_tryb;
                 idx_menu_akcja = 0;
                 Menu_Rysuj_Akcja();
+                deadline_pauza = HAL_GetTick() + 250U;
                 stan_gry = ST_MENU_AKCJA_CZEKAJ;
-                flg_ok = 0;
             }
             break;
 
@@ -1043,21 +1145,35 @@ static void Gra_ObsluzStan(void)
             if (flg_up && idx_menu_akcja > 0) { --idx_menu_akcja; Menu_Rysuj_Akcja(); flg_up = 0; }
             if (flg_dn && idx_menu_akcja < 2) { ++idx_menu_akcja; Menu_Rysuj_Akcja(); flg_dn = 0; }
             if (flg_ok) {
-                flg_ok = 0;
+                flg_up = flg_dn = flg_ok = 0;
+                deadline_pauza = HAL_GetTick() + 250U;
                 if (idx_menu_akcja == 0) {
                     /* GRAJ! */
-                    if (tryb_gry == TRYB_FREESTYLE) {
+                    if (tryb_gry == TRYB_MEMORY_MIX) {
                         Gra_PokazKomunikat("Gotow?", "Wcisnij przycisk");
                         stan_gry = ST_BEZCZYNNY;
-                    } else {
+                    } else if (tryb_gry == TRYB_MELODIE || tryb_gry == TRYB_ODTWARZAJ) {
                         Menu_Rysuj_Utwor();
                         stan_gry = ST_MENU_UTWOR_CZEKAJ;
+                    } else {
+                        /* TRYB_FREESTYLE – swobodna gra na 7 klawiszach */
+                        Gra_ZgasWszystkieLED();
+                        Dzwiek_Wylacz();
+                        Gra_PokazKomunikat("  Freestyle!    ", "Przytrzymaj=Menu");
+                        czas_trzymania_wyjscia = 0;
+                        aktywna_nuta_freestyle = -1;
+                        deadline_pauza = HAL_GetTick() + 300U; /* odczekaj puszczenie Entera */
+                        stan_gry = ST_WOLNA_GRA;
                     }
                 } else if (idx_menu_akcja == 1) {
                     /* USTAWIENIA */
-                    if (tryb_gry == TRYB_FREESTYLE) {
+                    if (tryb_gry == TRYB_MEMORY_MIX) {
                         Menu_Rysuj_Poziom();
                         stan_gry = ST_MENU_POZIOM_CZEKAJ;
+                    } else if (tryb_gry == TRYB_FREESTYLE) {
+                        idx_menu_dzwiek = dzwiek_wlaczony ? 0 : 1;
+                        Menu_Rysuj_Dzwiek();
+                        stan_gry = ST_MENU_DZW_CZEKAJ;
                     } else {
                         Menu_Rysuj_Predkosc();
                         stan_gry = ST_MENU_PRED_CZEKAJ;
@@ -1070,14 +1186,26 @@ static void Gra_ObsluzStan(void)
             }
             break;
 
-        /* -------- MENU – wybór utworu (dla trybu Melodie) -------- */
+        /* -------- MENU – wybór utworu (dla Melodie oraz Odtwarzaj) -------- */
         case ST_MENU_UTWOR_CZEKAJ:
             if (flg_up && idx_menu_utwor > 0)                  { --idx_menu_utwor; Menu_Rysuj_Utwor(); flg_up = 0; }
             if (flg_dn && idx_menu_utwor < (LICZBA_UTWOROW-1)) { ++idx_menu_utwor; Menu_Rysuj_Utwor(); flg_dn = 0; }
             if (flg_ok) {
-                flg_ok = 0;
-                Gra_PokazKomunikat("Gotow?", "Wcisnij przycisk");
-                stan_gry = ST_BEZCZYNNY;
+                flg_up = flg_dn = flg_ok = 0;
+                if (tryb_gry == TRYB_ODTWARZAJ) {
+                    /* Od razu odtwarzaj wybraną melodię w pętli z diodami */
+                    Gra_ZaladujUtwor(idx_menu_utwor);
+                    Gra_PokazKomunikat("Odtwarzanie...  ", "Kliknij = stop  ");
+                    idx_odtw = faza_odtw = 0;
+                    flg_stop_koncert = 0;
+                    deadline_pauza = HAL_GetTick() + 400U; /* blokada przypadkowego stopu przy puszczeniu Entera */
+                    deadline_odtw  = HAL_GetTick() + 400U;
+                    stan_gry = ST_KONCERT;
+                } else {
+                    Gra_PokazKomunikat("Gotow?", "Wcisnij przycisk");
+                    deadline_pauza = HAL_GetTick() + 250U;
+                    stan_gry = ST_BEZCZYNNY;
+                }
             }
             break;
 
@@ -1086,9 +1214,11 @@ static void Gra_ObsluzStan(void)
             if (flg_up)  { idx_menu_poziom = 0; Menu_Rysuj_Poziom(); flg_up  = 0; }
             if (flg_dn)  { idx_menu_poziom = 1; Menu_Rysuj_Poziom(); flg_dn  = 0; }
             if (flg_ok)  {
+                flg_up = flg_dn = flg_ok = 0;
                 trudnosc = idx_menu_poziom ? TR_TRUDNY : TR_LATWY;
                 Menu_Rysuj_Predkosc();
-                stan_gry = ST_MENU_PRED_CZEKAJ; flg_ok = 0;
+                deadline_pauza = HAL_GetTick() + 250U;
+                stan_gry = ST_MENU_PRED_CZEKAJ;
             }
             break;
 
@@ -1097,10 +1227,12 @@ static void Gra_ObsluzStan(void)
             if (flg_up  && idx_menu_pred)      { --idx_menu_pred; Menu_Rysuj_Predkosc(); flg_up = 0; }
             if (flg_dn  && idx_menu_pred < 2 ) { ++idx_menu_pred; Menu_Rysuj_Predkosc(); flg_dn = 0; }
             if (flg_ok) {
+                flg_up = flg_dn = flg_ok = 0;
                 predkosc_odtw  = (predkosc_t)idx_menu_pred;
                 idx_menu_dzwiek= dzwiek_wlaczony ? 0 : 1;
                 Menu_Rysuj_Dzwiek();
-                stan_gry = ST_MENU_DZW_CZEKAJ; flg_ok = 0;
+                deadline_pauza = HAL_GetTick() + 250U;
+                stan_gry = ST_MENU_DZW_CZEKAJ;
             }
             break;
 
@@ -1109,16 +1241,18 @@ static void Gra_ObsluzStan(void)
             if (flg_up) { idx_menu_dzwiek = 0; Menu_Rysuj_Dzwiek(); flg_up = 0; }
             if (flg_dn) { idx_menu_dzwiek = 1; Menu_Rysuj_Dzwiek(); flg_dn = 0; }
             if (flg_ok) {
+                flg_up = flg_dn = flg_ok = 0;
                 dzwiek_wlaczony = (idx_menu_dzwiek == 0);
                 idx_menu_akcja = 0; /* ustaw domyślnie kursor na "Graj!" */
                 Menu_Rysuj_Akcja();
+                deadline_pauza = HAL_GetTick() + 250U;
                 stan_gry = ST_MENU_AKCJA_CZEKAJ;
-                flg_ok = 0;
             }
             break;
 
         /* -------- tryb bezczynny – oczekiwanie startu -------- */
         case ST_BEZCZYNNY:
+            if (HAL_GetTick() < deadline_pauza) break; /* odczekaj puszczenie Entera */
             if (PRZYCISK_START) {
                 if (tryb_gry == TRYB_MELODIE) {
                     Gra_ZaladujUtwor(idx_menu_utwor);
@@ -1158,7 +1292,8 @@ static void Gra_ObsluzStan(void)
 
             if (faza_odtw == 0) {             /* faza ON */
                 HAL_GPIO_WritePin(LED_PORTY[led], LED_PINY[led], GPIO_PIN_SET);
-                Dzwiek_Wlacz(led);
+                deadline_buzzer = 0;          /* graj przez cały czas świecenia diody */
+                if (dzwiek_wlaczony) Buzzer_Ton(LED_NUTY[led]);
                 faza_odtw   = 1;
                 deadline_odtw = HAL_GetTick() + czas_on[predkosc_odtw];
             } else {                          /* faza OFF */
@@ -1181,7 +1316,8 @@ static void Gra_ObsluzStan(void)
                 Gra_PokazKomunikat("Brawo! Koncert!", "Kliknij = stop ");
                 idx_odtw = faza_odtw = 0;
                 flg_stop_koncert = 0;
-                deadline_odtw = HAL_GetTick() + 500U;
+                deadline_pauza = HAL_GetTick() + 500U; /* ochrona przed puszczeniem ostatniej nuty */
+                deadline_odtw  = HAL_GetTick() + 500U;
                 stan_gry = ST_KONCERT;
             } else {
                 Gra_PokazKomunikat("Brawo!", "");
@@ -1217,12 +1353,14 @@ static void Gra_ObsluzStan(void)
             stan_gry = ST_ODTWARZAJ;
             break;
 
-        /* -------- KONCERT: zapętlone odgrywanie całej melodii + LED -------- */
+        /* -------- KONCERT / ODTWARZACZ: zapętlone odgrywanie melodii + LED -------- */
         case ST_KONCERT:
-            if (flg_stop_koncert) {
+            if (flg_stop_koncert || (HAL_GetTick() >= deadline_pauza && PRZYCISK_START)) {
                 flg_stop_koncert = 0;
+                flg_up = flg_dn = flg_ok = 0;
                 Gra_ZgasWszystkieLED();
                 Dzwiek_Wylacz();
+                deadline_pauza = HAL_GetTick() + 300U;
                 idx_menu_akcja = 0;
                 Menu_Rysuj_Akcja();
                 stan_gry = ST_MENU_AKCJA_CZEKAJ;
@@ -1241,6 +1379,7 @@ static void Gra_ObsluzStan(void)
                 uint8_t nuta_led = sekwencja[idx_odtw];
                 if (faza_odtw == 0) {
                     HAL_GPIO_WritePin(LED_PORTY[nuta_led], LED_PINY[nuta_led], GPIO_PIN_SET);
+                    deadline_buzzer = 0;
                     if (dzwiek_wlaczony) Buzzer_Ton(LED_NUTY[nuta_led]);
                     faza_odtw = 1;
                     deadline_odtw = HAL_GetTick() + czas_on[predkosc_odtw];
@@ -1253,6 +1392,57 @@ static void Gra_ObsluzStan(void)
                 }
             }
             break;
+
+        /* -------- FREESTYLE: swobodne granie na 7 przyciskach jak na pianinie -------- */
+        case ST_WOLNA_GRA:
+        {
+            if (HAL_GetTick() < deadline_pauza) break;
+
+            int8_t wcisniety = -1;
+            uint8_t ile_wcisnietych = 0;
+            for (uint8_t i = 0; i < LICZBA_LED; ++i) {
+                if (HAL_GPIO_ReadPin(GPIOB, PRZ_PINY[i]) == GPIO_PIN_RESET) {
+                    HAL_GPIO_WritePin(LED_PORTY[i], LED_PINY[i], GPIO_PIN_SET);
+                    if (wcisniety < 0) wcisniety = (int8_t)i;
+                    ++ile_wcisnietych;
+                } else {
+                    HAL_GPIO_WritePin(LED_PORTY[i], LED_PINY[i], GPIO_PIN_RESET);
+                }
+            }
+
+            /* Wyjście do menu: przytrzymanie przycisku przez 1,5 s LUB 2 przyciski naraz */
+            if (wcisniety >= 0) {
+                if (czas_trzymania_wyjscia == 0) {
+                    czas_trzymania_wyjscia = HAL_GetTick();
+                } else if ((HAL_GetTick() - czas_trzymania_wyjscia >= 1500U) || (ile_wcisnietych >= 2)) {
+                    Gra_ZgasWszystkieLED();
+                    Dzwiek_Wylacz();
+                    aktywna_nuta_freestyle = -1;
+                    flg_up = flg_dn = flg_ok = 0;
+                    deadline_pauza = HAL_GetTick() + 400U;
+                    idx_menu_akcja = 0;
+                    Menu_Rysuj_Akcja();
+                    stan_gry = ST_MENU_AKCJA_CZEKAJ;
+                    break;
+                }
+            } else {
+                czas_trzymania_wyjscia = 0;
+            }
+
+            /* Sterowanie dźwiękiem na żywo dopóki trzymasz przycisk */
+            if (wcisniety >= 0) {
+                if (aktywna_nuta_freestyle != wcisniety) {
+                    aktywna_nuta_freestyle = wcisniety;
+                    if (dzwiek_wlaczony) Buzzer_Ton(LED_NUTY[wcisniety]);
+                }
+            } else {
+                if (aktywna_nuta_freestyle != -1) {
+                    aktywna_nuta_freestyle = -1;
+                    Buzzer_Ton(0);
+                }
+            }
+            break;
+        }
 
         /* -------- błąd -------- */
         case ST_PORAZKA:
@@ -1275,7 +1465,7 @@ static void Gra_ObsluzStan(void)
             if (flg_up) { idx_menu_koniec = 0; Menu_Rysuj_Koniec(); flg_up = 0; }
             if (flg_dn) { idx_menu_koniec = 1; Menu_Rysuj_Koniec(); flg_dn = 0; }
             if (flg_ok) {
-                flg_ok = 0;
+                flg_up = flg_dn = flg_ok = 0;
                 if (idx_menu_koniec == 0) {
                     if (tryb_gry == TRYB_MELODIE) {
                         Gra_ZaladujUtwor(idx_menu_utwor);
@@ -1287,6 +1477,7 @@ static void Gra_ObsluzStan(void)
                 } else {
                     idx_menu_akcja = 0;
                     Menu_Rysuj_Akcja();
+                    deadline_pauza = HAL_GetTick() + 250U;
                     stan_gry = ST_MENU_AKCJA_CZEKAJ;
                 }
             }
@@ -1314,6 +1505,14 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
                 HAL_GPIO_WritePin(LED_PORTY[i], LED_PINY[i], GPIO_PIN_RESET);
                 deadline_led_off[i] = 0;
             }
+            /* Blokada drgań przy puszczaniu: odliczaj dopiero po puszczeniu przycisku */
+            if (HAL_GPIO_ReadPin(GPIOB, PRZ_PINY[i]) == GPIO_PIN_RESET) {
+                if (prz_zablokowany[i] > 0) {
+                    prz_zablokowany[i] = (stan_gry == ST_OCZEKUJ) ? 45U : 80U;
+                }
+            } else if (prz_zablokowany[i] > 0) {
+                --prz_zablokowany[i];
+            }
         }
     }
     if (deadline_buzzer && HAL_GetTick() >= deadline_buzzer) {
@@ -1325,18 +1524,23 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 /* obsługa przycisków – EXTI 15-10 oraz EXTI 9-5 */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
+    /* W trybie swobodnej gry (Freestyle) przyciski są czytane bezpośrednio w pętli */
+    if (stan_gry == ST_WOLNA_GRA)
+        return;
+
     /* Ignoruj drgania styków przy puszczaniu przycisku (gdy pin wrócił na stan wysoki) */
     if (HAL_GPIO_ReadPin(GPIOB, GPIO_Pin) != GPIO_PIN_RESET)
         return;
 
-    /* prosty debounce dla wszystkich 7 przycisków */
+    /* debounce dla wszystkich 7 przycisków */
     static uint32_t t_ost[LICZBA_LED] = {0};
-    const  uint32_t odst = 120U;
     uint32_t teraz = HAL_GetTick();
+    uint32_t odst  = (stan_gry == ST_OCZEKUJ) ? 120U : 220U;
 
     int8_t wcisniety = -1;
     for (uint8_t i = 0; i < LICZBA_LED; ++i) {
         if (GPIO_Pin == PRZ_PINY[i]) {
+            if (prz_zablokowany[i] > 0) return;
             if ((teraz - t_ost[i]) < odst) return;
             wcisniety = i;
             break;
@@ -1346,7 +1550,9 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 
     /* zatrzymanie zapętlonego koncertu dowolnym przyciskiem */
     if (stan_gry == ST_KONCERT) {
+        if (teraz < deadline_pauza) return; /* ignoruj puszczenie przycisku z menu */
         t_ost[wcisniety] = teraz;
+        prz_zablokowany[wcisniety] = 80U;
         flg_stop_koncert = 1;
         return;
     }
@@ -1359,7 +1565,9 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
         stan_gry == ST_MENU_PRED_CZEKAJ   ||
         stan_gry == ST_MENU_DZW_CZEKAJ    ||
         stan_gry == ST_KONIEC_CZEKAJ) {
+        if (teraz < deadline_pauza) return; /* blokada przeskakiwania dwóch ekranów menu */
         t_ost[wcisniety] = teraz;
+        prz_zablokowany[wcisniety] = 80U;
         if (GPIO_Pin == GPIO_PIN_13) flg_up = 1; // 1. przycisk = Lewo (<)
         if (GPIO_Pin == GPIO_PIN_14) flg_dn = 1; // 2. przycisk = Prawo (>)
         if (GPIO_Pin == GPIO_PIN_15) flg_ok = 1; // 3. przycisk = Enter (OK)
@@ -1372,6 +1580,7 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 
     /* zapisz czas debounce dopiero dla faktycznego kliknięcia w grze */
     t_ost[wcisniety] = teraz;
+    prz_zablokowany[wcisniety] = 45U;
 
     /* przyciski w trakcie gry (0..6) */
     uint8_t i = (uint8_t)wcisniety;
